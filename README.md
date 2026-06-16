@@ -12,11 +12,11 @@ A minimal blog engine you run from your terminal. Write posts from the CLI, serv
 ## TODO
 
 ### Persistence
-- [ ] Replace in-memory maps with SQLite
-- [ ] Auto-create DB + tables on startup
+- [x] Replace in-memory maps with SQLite
+- [x] Auto-create DB + tables on startup
 
 ### Blog system
-- [ ] Blog post model (id, title, body, author, created_at)
+- [x] Blog post model (id, title, body, author, created_at)
 - [x] Create post endpoint `POST /api/posts`
 - [x] List posts endpoint `GET /api/posts`
 - [x] Get single post endpoint `GET /api/posts/:id`
