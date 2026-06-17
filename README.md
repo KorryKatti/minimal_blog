@@ -23,10 +23,10 @@ A minimal blog engine you run from your terminal. Write posts from the CLI, serv
 - [x] Delete post endpoint `DELETE /api/posts/:id`
 
 ### Auth
-- [ ] Hash passwords with bcrypt
-- [ ] Token-based auth (JWT or simple tokens)
-- [ ] Auth middleware for protected routes
-- [ ] Terminal app sends auth headers
+- [x] Hash passwords with bcrypt
+- [x] Token-based auth (JWT or simple tokens)
+- [x] Auth middleware for protected routes
+- [x] Terminal app sends auth headers
 
 ### Engagement
 - [ ] Comments — create and list per post
