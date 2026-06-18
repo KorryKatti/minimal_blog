@@ -29,10 +29,10 @@ A minimal blog engine you run from your terminal. Write posts from the CLI, serv
 - [x] Terminal app sends auth headers
 
 ### Engagement
-- [ ] Comments — create and list per post
-- [ ] Replies to comments
-- [ ] Upvotes / downvotes on posts
-- [ ] Vote counts in post responses
+- [x] Comments — create and list per post
+- [x] Replies to comments
+- [x] Upvotes / downvotes on posts
+- [x] Vote counts in post responses
 
 ### API polish
 - [ ] JSON responses (not plain text)

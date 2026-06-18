@@ -64,6 +64,47 @@ delete_post() {
 	echo
 }
 
+comment() {
+	if ! has_token; then
+		echo "Not signed in."
+		return
+	fi
+	curl -s -X POST "$BASE_URL/api/posts/$1/comments" \
+		-H "Content-Type: application/json" \
+		-H "Authorization: Bearer $(get_token)" \
+		-d "{\"body\":\"$2\"}"
+	echo
+}
+
+reply() {
+	if ! has_token; then
+		echo "Not signed in."
+		return
+	fi
+	curl -s -X POST "$BASE_URL/api/posts/$1/comments" \
+		-H "Content-Type: application/json" \
+		-H "Authorization: Bearer $(get_token)" \
+		-d "{\"body\":\"$2\",\"parent_id\":$3}"
+	echo
+}
+
+get_comments() {
+	curl -s "$BASE_URL/posts/$1/comments"
+	echo
+}
+
+vote() {
+	if ! has_token; then
+		echo "Not signed in."
+		return
+	fi
+	curl -s -X POST "$BASE_URL/api/posts/$1/vote" \
+		-H "Content-Type: application/json" \
+		-H "Authorization: Bearer $(get_token)" \
+		-d "{\"value\":$2}"
+	echo
+}
+
 # route commands
 case "$1" in
 	signup) signup "$2" "$3" ;;
@@ -72,5 +113,9 @@ case "$1" in
 	list) list_posts ;;
 	get) get_post "$2" ;;
 	delete) delete_post "$2" ;;
+	comment) comment "$2" "$3" ;;
+reply) reply "$2" "$3" "$4" ;;
+comments) get_comments "$2" ;;
+vote) vote "$2" "$3" ;;
 	*) echo "Usage: $0 {signup|signin|create|list|get|delete} [args]" ;;
 esac
