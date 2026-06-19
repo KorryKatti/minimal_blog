@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -88,6 +89,131 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+
+
+// =====================
+// Rate Limiting
+// =====================
+type rateLimiter struct {
+	count int // how many requests so far
+	resetAt time.Time
+	mu sync.Mutex
+}
+
+// global map of ip->limiter
+var (
+	rateLimiters = make(map[string]*rateLimiter)
+	rateLimitersMu sync.Mutex
+)
+
+const (
+	rateLimitWindow = time.Minute // 1 minute window
+	rateLimitMax = 60 // max 60 requests per minute per ip
+)
+
+// ratelimitmiddleware enforces rate limits
+func rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc{
+	return func(w http.ResponseWriter,r *http.Request){
+		// get client ip
+		ip:=r.RemoteAddr
+		// strip port from remote address
+		if host,_,err := net.SplitHostPort(ip);err==nil{
+			ip=host
+		}
+		// lock the global map to get/crate this ip's limiter
+		rateLimitersMu.Lock()
+		lim,exists := rateLimiters[ip]
+		if !exists {
+			lim = &rateLimiter{resetAt: time.Now().Add(rateLimitWindow)}
+			rateLimiters[ip]=lim
+		}
+		rateLimitersMu.Unlock()
+
+		// now lock just this IP's limiter
+		lim.mu.Lock()
+		defer lim.mu.Unlock()
+
+		// check if window expired-> reset counter
+		now := time.Now()
+		if now.After(lim.resetAt){
+			lim.count=0
+			lim.resetAt=now.Add(rateLimitWindow)
+		}
+		// increment and check
+		lim.count++
+		if lim.count > rateLimitMax{
+			writeError(w,http.StatusTooManyRequests,"rate limit exceeded try again")
+			return
+		}
+		next(w,r)
+	}
+}
+
+func validateUsername(username string) error {
+	if username == ""{
+		return fmt.Errorf("username is required")
+	}
+	if len(username)<3 || len(username)>30{
+		return fmt.Errorf("username must be between 3-30 characters")
+	}
+		for _, ch := range username {
+		if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '-') {
+			return fmt.Errorf("username can only contain letters, numbers, underscores, and hyphens")
+		}
+	}
+	return nil
+}
+
+func validatePassword(password string) error {
+	if len(password) < 6 {
+		return fmt.Errorf("password must be at least 6 characters")
+	}
+	if len(password) > 100 {
+		return fmt.Errorf("password too long")
+	}
+	return nil
+}
+
+func sanitizeString(s string) string {
+	// strings.NewReplacer replaces multiple substrings in one pass
+	// It's efficient — goes through the string once, not 4 times
+	replacer := strings.NewReplacer(
+		"&", "&amp;",   // must be first! otherwise & in others gets double-escaped
+		"<", "&lt;",
+		">", "&gt;",
+		"\"", "&quot;",
+	)
+	return replacer.Replace(s)
+}
+
+// validatePost checks title and body for valid content
+func validatePost(title, body string) error {
+	if strings.TrimSpace(title) == "" {
+		return fmt.Errorf("title is required")
+	}
+	if len(title) > 200 {
+		return fmt.Errorf("title too long (max 200 characters)")
+	}
+	if strings.TrimSpace(body) == "" {
+		return fmt.Errorf("body is required")
+	}
+	if len(body) > 100000 {
+		return fmt.Errorf("body too long (max 100000 characters)")
+	}
+	return nil
+}
+
+// validateComment checks comment body
+func validateComment(body string) error {
+	if strings.TrimSpace(body) == "" {
+		return fmt.Errorf("comment body is required")
+	}
+	if len(body) > 2000 {
+		return fmt.Errorf("comment too long (max 2000 characters)")
+	}
+	return nil
+}
+
 // =====================
 // Global State
 // =====================
@@ -119,62 +245,62 @@ func main() {
 	mux := http.NewServeMux()
 
 
-// public routes — CORS + no auth
-	mux.HandleFunc("/", corsMiddleware(getRoot))
-	mux.HandleFunc("/hello", corsMiddleware(getHello))
-	mux.HandleFunc("/signup", corsMiddleware(signupHandler))
-	mux.HandleFunc("/signin", corsMiddleware(signinHandler))
-	mux.HandleFunc("/posts", corsMiddleware(listPosts))      // GET list
-	mux.HandleFunc("/posts/", corsMiddleware(postByIDHandler))  // GET single + comments
+	// public routes — Rate limit → CORS → handler
+	mux.HandleFunc("/", rateLimitMiddleware(corsMiddleware(getRoot)))
+	mux.HandleFunc("/hello", rateLimitMiddleware(corsMiddleware(getHello)))
+	mux.HandleFunc("/signup", rateLimitMiddleware(corsMiddleware(signupHandler)))
+	mux.HandleFunc("/signin", rateLimitMiddleware(corsMiddleware(signinHandler)))
+	mux.HandleFunc("/posts", rateLimitMiddleware(corsMiddleware(listPosts)))
+	mux.HandleFunc("/posts/", rateLimitMiddleware(corsMiddleware(postByIDHandler)))
 
-// protected routes — CORS + auth middleware
-	mux.HandleFunc("/api/posts", corsMiddleware(authMiddleware(func(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodPost {
-		createPost(w, r)
-		return
-	}
-	writeError(w, http.StatusMethodNotAllowed, "only POST allowed")
-	})))
-
-	mux.HandleFunc("/api/posts/", corsMiddleware(authMiddleware(func(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/api/posts/")
-	parts := strings.Split(path, "/")
-	if len(parts) < 1 {
-		writeError(w, http.StatusBadRequest, "invalid path")
-		return
-	}
-	id, err := strconv.Atoi(parts[0])
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid post ID")
-		return
-	}
-
-	if len(parts) == 1 {
-		if r.Method == http.MethodDelete {
-			deletePost(w, r, id)
-			return
-		}
-		writeError(w, http.StatusMethodNotAllowed, "only DELETE allowed")
-		return
-	}
-
-	switch parts[1] {
-	case "comments":
+	// protected routes — Rate limit → CORS → Auth → handler
+	mux.HandleFunc("/api/posts", rateLimitMiddleware(corsMiddleware(authMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
-			createComment(w, r, id)
+			createPost(w, r)
 			return
 		}
 		writeError(w, http.StatusMethodNotAllowed, "only POST allowed")
-	case "vote":
-		if r.Method == http.MethodPost {
-			votePost(w, r, id)
+	}))))
+
+	mux.HandleFunc("/api/posts/", rateLimitMiddleware(corsMiddleware(authMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, "/api/posts/")
+		parts := strings.Split(path, "/")
+		if len(parts) < 1 {
+			writeError(w, http.StatusBadRequest, "invalid path")
 			return
 		}
-		writeError(w, http.StatusMethodNotAllowed, "only POST allowed")
-	default:
-		writeError(w, http.StatusNotFound, "unknown endpoint")
-	}
-	})))
+		id, err := strconv.Atoi(parts[0])
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid post ID")
+			return
+		}
+
+		if len(parts) == 1 {
+			if r.Method == http.MethodDelete {
+				deletePost(w, r, id)
+				return
+			}
+			writeError(w, http.StatusMethodNotAllowed, "only DELETE allowed")
+			return
+		}
+
+		switch parts[1] {
+		case "comments":
+			if r.Method == http.MethodPost {
+				createComment(w, r, id)
+				return
+			}
+			writeError(w, http.StatusMethodNotAllowed, "only POST allowed")
+		case "vote":
+			if r.Method == http.MethodPost {
+				votePost(w, r, id)
+				return
+			}
+			writeError(w, http.StatusMethodNotAllowed, "only POST allowed")
+		default:
+			writeError(w, http.StatusNotFound, "unknown endpoint")
+		}
+	}))))
 
 	ctx, cancelCtx := context.WithCancel(context.Background())
 
@@ -293,6 +419,18 @@ func signupHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	u.Username = strings.TrimSpace(u.Username)
+	u.Password = strings.TrimSpace(u.Password)
+
+	if err := validateUsername(u.Username); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := validatePassword(u.Password); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	hashedPw, err := bcrypt.GenerateFromPassword([]byte(u.Password), bcrypt.DefaultCost)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to hash password")
@@ -321,6 +459,14 @@ func signinHandler(w http.ResponseWriter, r *http.Request) {
 	var u User
 	if err := json.NewDecoder(r.Body).Decode(&u); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	u.Username = strings.TrimSpace(u.Username)
+	u.Password = strings.TrimSpace(u.Password)
+
+	if err := validateUsername(u.Username); err != nil {
+		writeError(w, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
 
@@ -454,10 +600,17 @@ func createPost(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.Title == "" || req.Body == "" {
-		writeError(w, http.StatusBadRequest, "title and body are required")
+
+	req.Title = strings.TrimSpace(req.Title)
+	req.Body = strings.TrimSpace(req.Body)
+
+	if err := validatePost(req.Title, req.Body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
+	req.Title = sanitizeString(req.Title)
+	req.Body = sanitizeString(req.Body)
 
 	res, err := db.Exec(
 		"INSERT INTO posts (title, body, author) VALUES (?, ?, ?)",
@@ -585,13 +738,18 @@ func createComment(w http.ResponseWriter, r *http.Request, postID int) {
 		writeError(w, http.StatusBadRequest, "invalid body")
 		return
 	}
-	if req.Body == "" {
-		writeError(w, http.StatusBadRequest, "body required")
+
+	req.Body = strings.TrimSpace(req.Body)
+
+	if err := validateComment(req.Body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
+	req.Body = sanitizeString(req.Body)
+
 	res, err := db.Exec(
-		"INSERT INTO comments (post_id, parent_id,author,body) VALUES (?,?,?,?)",
+		"INSERT INTO comments (post_id, parent_id, author, body) VALUES (?, ?, ?, ?)",
 		postID, req.ParentID, author, req.Body,
 	)
 	if err != nil {
