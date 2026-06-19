@@ -51,6 +51,43 @@ type VoteRequest struct {
 	Value int `json:"value"` // 1 or -1
 }
 
+// standard JSON response wrapper
+type Response struct {
+	Data  interface{} `json:"data,omitempty"`  // success payload (omitempty = skip if nil)
+	Error string      `json:"error,omitempty"` // error message (omitempty = skip if empty)
+}
+
+// writeJSON sends a JSON response with proper Content-Type
+func writeJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(Response{Data: data})
+}
+
+// writeError sends a consistent error response
+func writeError(w http.ResponseWriter, status int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(Response{Error: message})
+}
+
+// corsMiddleware wraps handlers to add CORS headers
+func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		// preflight request — browser sends OPTIONS before actual request
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		next(w, r)
+	}
+}
+
 // =====================
 // Global State
 // =====================
@@ -81,66 +118,63 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	// basic routes
-	mux.HandleFunc("/", getRoot)
-	mux.HandleFunc("/hello", getHello)
 
-	// auth routes
-	mux.HandleFunc("/signup", signupHandler)
-	mux.HandleFunc("/signin", signinHandler)
+// public routes — CORS + no auth
+	mux.HandleFunc("/", corsMiddleware(getRoot))
+	mux.HandleFunc("/hello", corsMiddleware(getHello))
+	mux.HandleFunc("/signup", corsMiddleware(signupHandler))
+	mux.HandleFunc("/signin", corsMiddleware(signinHandler))
+	mux.HandleFunc("/posts", corsMiddleware(listPosts))      // GET list
+	mux.HandleFunc("/posts/", corsMiddleware(postByIDHandler))  // GET single + comments
 
-	// public post routes
-	mux.HandleFunc("/posts", postHandler)
-	mux.HandleFunc("/posts/", func(w http.ResponseWriter, r *http.Request) {
-		path := strings.TrimPrefix(r.URL.Path, "/posts/")
-		parts := strings.Split(path, "/")
-		if len(parts) == 2 && parts[1] == "comments" {
-			commentsHandler(w, r)
+// protected routes — CORS + auth middleware
+	mux.HandleFunc("/api/posts", corsMiddleware(authMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		createPost(w, r)
+		return
+	}
+	writeError(w, http.StatusMethodNotAllowed, "only POST allowed")
+	})))
+
+	mux.HandleFunc("/api/posts/", corsMiddleware(authMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/api/posts/")
+	parts := strings.Split(path, "/")
+	if len(parts) < 1 {
+		writeError(w, http.StatusBadRequest, "invalid path")
+		return
+	}
+	id, err := strconv.Atoi(parts[0])
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid post ID")
+		return
+	}
+
+	if len(parts) == 1 {
+		if r.Method == http.MethodDelete {
+			deletePost(w, r, id)
 			return
 		}
-		postByIDHandler(w, r)
-	})
+		writeError(w, http.StatusMethodNotAllowed, "only DELETE allowed")
+		return
+	}
 
-	// protected post routes
-	mux.HandleFunc("/api/posts", authMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	switch parts[1] {
+	case "comments":
 		if r.Method == http.MethodPost {
-			createPost(w, r)
+			createComment(w, r, id)
 			return
 		}
-		http.Error(w, "only POST allowed", http.StatusMethodNotAllowed)
-	}))
-
-	mux.HandleFunc("/api/posts/", authMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		path := strings.TrimPrefix(r.URL.Path, "/api/posts/")
-		parts := strings.Split(path, "/")
-		if len(parts) < 1 {
-			http.Error(w, "invalid path", http.StatusBadRequest) // prolly will never happen
+		writeError(w, http.StatusMethodNotAllowed, "only POST allowed")
+	case "vote":
+		if r.Method == http.MethodPost {
+			votePost(w, r, id)
 			return
 		}
-		id, err := strconv.Atoi(parts[0])
-		if err != nil {
-			http.Error(w, "invalid post ID", http.StatusBadRequest)
-			return
-		}
-
-		if len(parts) == 1 {
-			if r.Method == http.MethodDelete {
-				deletePost(w, r, id)
-			}
-			return
-		}
-
-		switch parts[1] {
-		case "comments":
-			if r.Method == http.MethodPost {
-				createComment(w, r, id)
-			}
-		case "vote":
-			if r.Method == http.MethodPost {
-				votePost(w, r, id)
-			}
-		}
-	}))
+		writeError(w, http.StatusMethodNotAllowed, "only POST allowed")
+	default:
+		writeError(w, http.StatusNotFound, "unknown endpoint")
+	}
+	})))
 
 	ctx, cancelCtx := context.WithCancel(context.Background())
 
@@ -249,72 +283,67 @@ func getHello(w http.ResponseWriter, r *http.Request) {
 
 func signupHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "only POST allowed", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "only POST allowed")
 		return
 	}
 
 	var u User
 	if err := json.NewDecoder(r.Body).Decode(&u); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
 	hashedPw, err := bcrypt.GenerateFromPassword([]byte(u.Password), bcrypt.DefaultCost)
 	if err != nil {
-		http.Error(w, "failed to hash password", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "failed to hash password")
 		return
 	}
 
-	res, err := db.Exec("INSERT INTO users (username, password) VALUES (?, ?)", u.Username, string(hashedPw))
+	_, err = db.Exec("INSERT INTO users (username, password) VALUES (?, ?)", u.Username, string(hashedPw))
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
-			http.Error(w, "user already exists", http.StatusBadRequest)
+			writeError(w, http.StatusBadRequest, "user already exists")
 			return
 		}
-		http.Error(w, "database error", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "database error")
 		return
 	}
 
-	rows, _ := res.RowsAffected()
-	if rows == 0 {
-		http.Error(w, "user already exists", http.StatusBadRequest)
-		return
-	}
-
-	w.WriteHeader(http.StatusCreated)
-	io.WriteString(w, "user created successfully\n")
+	writeJSON(w, http.StatusCreated, map[string]string{"message": "user created"})
 }
 
 func signinHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "only POST allowed", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "only POST allowed")
 		return
 	}
 
 	var u User
 	if err := json.NewDecoder(r.Body).Decode(&u); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
 	var storedHash string
 	err := db.QueryRow("SELECT password FROM users WHERE username = ?", u.Username).Scan(&storedHash)
 	if err == sql.ErrNoRows {
-		http.Error(w, "invalid credentials", http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
 	if err != nil {
-		http.Error(w, "database error", http.StatusInternalServerError)
-		return
-	}
-	if err := bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(u.Password)); err != nil {
-		http.Error(w, "invalid credentials", http.StatusUnauthorized)
+		writeError(w, http.StatusInternalServerError, "database error")
 		return
 	}
 
+	if err := bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(u.Password)); err != nil {
+		writeError(w, http.StatusUnauthorized, "invalid credentials")
+		return
+	}
+
+	// generate token
 	tokenBytes := make([]byte, 32)
 	if _, err := rand.Read(tokenBytes); err != nil {
-		http.Error(w, "failed to generate token", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "failed to generate token")
 		return
 	}
 	token := hex.EncodeToString(tokenBytes)
@@ -324,21 +353,18 @@ func signinHandler(w http.ResponseWriter, r *http.Request) {
 		token, u.Username,
 	)
 	if err != nil {
-		http.Error(w, "failed to create session", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "failed to create session")
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"token": token,
-	})
+	writeJSON(w, http.StatusOK, map[string]string{"token": token})
 }
 
 func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		authHeader := r.Header.Get("Authorization")
 		if authHeader == "" {
-			http.Error(w, "missing auth token", http.StatusUnauthorized)
+			writeError(w, http.StatusUnauthorized, "missing auth token")
 			return
 		}
 
@@ -346,7 +372,7 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		if len(authHeader) > 7 && authHeader[:7] == "Bearer " {
 			token = authHeader[7:]
 		} else {
-			http.Error(w, "invalid auth header format", http.StatusUnauthorized)
+			writeError(w, http.StatusUnauthorized, "invalid auth header format")
 			return
 		}
 
@@ -356,11 +382,11 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			token,
 		).Scan(&username)
 		if err == sql.ErrNoRows {
-			http.Error(w, "invalid or expired token", http.StatusUnauthorized)
+			writeError(w, http.StatusUnauthorized, "invalid or expired token")
 			return
 		}
 		if err != nil {
-			http.Error(w, "database error", http.StatusInternalServerError)
+			writeError(w, http.StatusInternalServerError, "database error")
 			return
 		}
 
@@ -380,16 +406,26 @@ func postHandler(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		listPosts(w, r)
 	default:
-		http.Error(w, "only Post or Get allowed", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "only POST or GET allowed")
 	}
 }
 
 func postByIDHandler(w http.ResponseWriter, r *http.Request) {
-	idStr := strings.TrimPrefix(r.URL.Path, "/posts/")
+	path := strings.TrimPrefix(r.URL.Path, "/posts/")
+	parts := strings.Split(path, "/")
 
-	id, err := strconv.Atoi(idStr)
+	id, err := strconv.Atoi(parts[0])
 	if err != nil {
-		http.Error(w, "invalid post id", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "invalid post id")
+		return
+	}
+
+	if len(parts) > 1 && parts[1] == "comments" {
+		if r.Method == http.MethodGet {
+			commentsHandler(w, r, id)
+			return
+		}
+		writeError(w, http.StatusMethodNotAllowed, "only GET allowed")
 		return
 	}
 
@@ -399,14 +435,14 @@ func postByIDHandler(w http.ResponseWriter, r *http.Request) {
 	case http.MethodDelete:
 		deletePost(w, r, id)
 	default:
-		http.Error(w, "only get or delete allowed", http.StatusMethodNotAllowed)
+		writeError(w, http.StatusMethodNotAllowed, "only get or delete allowed")
 	}
 }
 
 func createPost(w http.ResponseWriter, r *http.Request) {
 	author, ok := r.Context().Value("username").(string)
 	if !ok || author == "" {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 
@@ -415,11 +451,11 @@ func createPost(w http.ResponseWriter, r *http.Request) {
 		Body  string `json:"body"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if req.Title == "" || req.Body == "" {
-		http.Error(w, "title and body are required", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "title and body are required")
 		return
 	}
 
@@ -428,7 +464,7 @@ func createPost(w http.ResponseWriter, r *http.Request) {
 		req.Title, req.Body, author,
 	)
 	if err != nil {
-		http.Error(w, "database error", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "database error")
 		return
 	}
 
@@ -440,12 +476,11 @@ func createPost(w http.ResponseWriter, r *http.Request) {
 		id,
 	).Scan(&post.ID, &post.Title, &post.Body, &post.Author, &post.CreatedAt)
 	if err != nil {
-		http.Error(w, "database error", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "database error")
 		return
 	}
 
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(post)
+	writeJSON(w, http.StatusCreated, post)
 }
 
 func listPosts(w http.ResponseWriter, r *http.Request) {
@@ -468,7 +503,7 @@ func listPosts(w http.ResponseWriter, r *http.Request) {
 		ORDER BY p.created_at DESC
 	`)
 	if err != nil {
-		http.Error(w, "database error", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "database error")
 		return
 	}
 	defer rows.Close()
@@ -482,8 +517,7 @@ func listPosts(w http.ResponseWriter, r *http.Request) {
 		posts = append(posts, p)
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(posts)
+	writeJSON(w, http.StatusOK, posts)
 }
 
 func getPost(w http.ResponseWriter, r *http.Request, id int) {
@@ -508,39 +542,38 @@ func getPost(w http.ResponseWriter, r *http.Request, id int) {
 	`, id).Scan(&p.ID, &p.Title, &p.Body, &p.Author, &p.CreatedAt, &p.Upvotes, &p.Downvotes, &p.Score)
 
 	if err == sql.ErrNoRows {
-		http.Error(w, "post not found", http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "post not found")
 		return
 	}
 	if err != nil {
-		http.Error(w, "database error", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "database error")
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(p)
+	writeJSON(w, http.StatusOK, p)
 }
 
 func deletePost(w http.ResponseWriter, r *http.Request, id int) {
 	res, err := db.Exec("DELETE FROM posts WHERE id = ?", id)
 	if err != nil {
-		http.Error(w, "database error", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "database error")
 		return
 	}
 
 	rows, _ := res.RowsAffected()
 	if rows == 0 {
-		http.Error(w, "post not found", http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "post not found")
 		return
 	}
 
-	w.WriteHeader(http.StatusNoContent)
+	writeJSON(w, http.StatusNoContent, nil)
 }
 
 func createComment(w http.ResponseWriter, r *http.Request, postID int) {
 	author, ok := r.Context().Value("username").(string)
 
 	if !ok {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 
@@ -549,11 +582,11 @@ func createComment(w http.ResponseWriter, r *http.Request, postID int) {
 		ParentID *int   `json:"parent_id,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid body", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "invalid body")
 		return
 	}
 	if req.Body == "" {
-		http.Error(w, "body required", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "body required")
 		return
 	}
 
@@ -562,7 +595,7 @@ func createComment(w http.ResponseWriter, r *http.Request, postID int) {
 		postID, req.ParentID, author, req.Body,
 	)
 	if err != nil {
-		http.Error(w, "database error", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "database error")
 		return
 	}
 
@@ -574,29 +607,16 @@ func createComment(w http.ResponseWriter, r *http.Request, postID int) {
 	).Scan(&c.ID, &c.PostID, &c.ParentID, &c.Author, &c.Body, &c.CreatedAt)
 
 	if err != nil {
-		http.Error(w, "database error", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "database error")
 		return
 	}
 
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(c)
+	writeJSON(w, http.StatusCreated, c)
 }
 
-func commentsHandler(w http.ResponseWriter, r *http.Request) {
+func commentsHandler(w http.ResponseWriter, r *http.Request, postID int) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "only get ", http.StatusMethodNotAllowed)
-		return
-	}
-
-	path := strings.TrimPrefix(r.URL.Path, "/posts/")
-	parts := strings.Split(path, "/")
-	if len(parts) != 2 || parts[1] != "comments" { //surely there is a better way
-		http.Error(w, "invalid path", http.StatusBadRequest)
-		return
-	}
-	postID, err := strconv.Atoi(parts[0])
-	if err != nil {
-		http.Error(w, "invalid post ID", http.StatusBadRequest)
+		writeError(w, http.StatusMethodNotAllowed, "only GET allowed")
 		return
 	}
 
@@ -606,13 +626,12 @@ func commentsHandler(w http.ResponseWriter, r *http.Request) {
 		postID,
 	)
 	if err != nil {
-		http.Error(w, "database error", http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, "database error")
 		return
 	}
 	defer rows.Close()
 
 	// load all comments in memory
-	// sounds bad
 	allComments := make(map[int]Comment)
 	var topLevel []Comment
 
@@ -629,46 +648,43 @@ func commentsHandler(w http.ResponseWriter, r *http.Request) {
 		if c.ParentID == nil {
 			topLevel = append(topLevel, c)
 		} else {
-			// has parent = reply, add to parent's Replies slice
 			parent := allComments[*c.ParentID]
 			parent.Replies = append(parent.Replies, c)
-			allComments[*c.ParentID] = parent // update in map
+			allComments[*c.ParentID] = parent
 		}
 	}
-	// now update topLevel with modified parents that have reploes populated
-	for i:=range topLevel{
-		topLevel[i]=allComments[topLevel[i].ID]
+	for i := range topLevel {
+		topLevel[i] = allComments[topLevel[i].ID]
 	}
-	w.Header().Set("Content-Type","application/json")
-	json.NewEncoder(w).Encode(topLevel)
+
+	writeJSON(w, http.StatusOK, topLevel)
 }
 
-func votePost(w http.ResponseWriter,r *http.Request, postID int){
-	author,ok := r.Context().Value("username").(string)
+func votePost(w http.ResponseWriter, r *http.Request, postID int) {
+	author, ok := r.Context().Value("username").(string)
 	if !ok {
-		http.Error(w,"unahotizied",http.StatusUnauthorized)
+		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 
 	var req VoteRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err!=nil {
-		http.Error(w,"invalid body",http.StatusBadRequest)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body")
 		return
 	}
-	if req.Value != 1 && req.Value!=-1{
-		http.Error(w,"value must be 1 or -1",http.StatusBadRequest)
+	if req.Value != 1 && req.Value != -1 {
+		writeError(w, http.StatusBadRequest, "value must be 1 or -1")
 		return
 	}
 
-	_,err := db.Exec(
+	_, err := db.Exec(
 		"INSERT OR REPLACE INTO votes (post_id,username,value) VALUES (?,?,?)",
-		postID,author,req.Value,
+		postID, author, req.Value,
 	)
-	if err!=nil{
-		http.Error(w,"database error",http.StatusInternalServerError)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "database error")
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
-	io.WriteString(w,"voted\n")
+	writeJSON(w, http.StatusOK, map[string]string{"message": "voted"})
 }

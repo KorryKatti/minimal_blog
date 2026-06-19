@@ -35,11 +35,9 @@ A minimal blog engine you run from your terminal. Write posts from the CLI, serv
 - [x] Vote counts in post responses
 
 ### API polish
-- [ ] JSON responses (not plain text)
-- [ ] Proper Content-Type headers
-- [ ] CORS headers for custom frontends
-- [ ] Consistent error response format
-- [ ] API versioning (`/api/v1/...`)
+- [x] JSON responses (not plain text)
+- [x] CORS headers for custom frontends
+- [x] Consistent error response format
 
 ### Security
 - [ ] Rate limiting
